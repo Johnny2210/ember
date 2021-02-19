@@ -64,7 +64,7 @@ func main() {
 	}
 	defer out.Close()
 
-	err = embedding.EmbedFiles(out, exe, attachments, func(format string, args ...interface{}) {
+	err = embedding.EmbedFiles(out, exe, attachments, cmd.Executable, func(format string, args ...interface{}) {
 		fmt.Printf("\t"+format+"\n", args...)
 	})
 	if err != nil {
