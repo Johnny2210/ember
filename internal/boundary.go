@@ -51,6 +51,18 @@ func SeekBoundary(in io.ReadSeeker) int64 {
 	return SeekPattern(in, boundary)
 }
 
+// SeekBeforeBoundary reads from the reader until the beginning of the boundary.
+// Returns the offset until the beginning of the boundary.
+// Returns -1 if the boundary was not found.
+func SeekBeforeBoundary(in io.ReadSeeker) int64 {
+	offsetBoundary := SeekBoundary(in)
+	offsetBeforeBoundary := offsetBoundary - int64(len(boundary))
+	if offsetBeforeBoundary < 0 {
+		return -1
+	}
+	return offsetBeforeBoundary
+}
+
 // SeekPattern reads from the reader until the search pattern was found.
 // The next byte coming from the reader will be the first byte after the pattern ended.
 // Returns the number of bytes (offset) that were read (including the pattern itself).

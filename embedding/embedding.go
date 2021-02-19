@@ -5,9 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
+	"log"
 	"os"
+	"path/filepath"
 	"strings"
 
+	"github.com/maja42/ember"
 	"github.com/maja42/ember/internal"
 )
 
@@ -15,6 +19,10 @@ const compatibleVersion = "maja42/ember/v1"
 
 // PrintlnFunc is used for logging the embedding progress.
 type PrintlnFunc func(format string, args ...interface{})
+
+type alreadyEmbedded struct {
+	resources map[string]string
+}
 
 // Embed embeds the attachments into the target executable.
 //
@@ -31,13 +39,9 @@ type PrintlnFunc func(format string, args ...interface{})
 //
 // Note that all ReadSeekers are seeked to their start before usage,
 // meaning the entirety of readable content is embedded. Use io.SectionReader to avoid this.
-func Embed(out io.Writer, exe io.ReadSeeker, attachments map[string]io.ReadSeeker, logger PrintlnFunc) error {
+func Embed(out io.Writer, exe io.ReadSeeker, attachments map[string]io.ReadSeeker, exePath string, offset int64, logger PrintlnFunc) error {
 	if logger == nil {
 		logger = func(string, ...interface{}) {}
-	}
-
-	if err := verifyTargetExe(exe); err != nil {
-		return fmt.Errorf("verify executable: %w", err)
 	}
 
 	toc, err := buildTOC(attachments)
@@ -52,8 +56,64 @@ func Embed(out io.Writer, exe io.ReadSeeker, attachments map[string]io.ReadSeeke
 	// Executable
 	logger("Writing executable")
 	if _, err := io.Copy(out, exe); err != nil {
-		return fmt.Errorf("copy executable: %w", err)
+		return fmt.Errorf("error writing executable: %w", err)
 	}
+	// Boundary
+	if err := internal.WriteBoundary(out); err != nil {
+		return err
+	}
+	// TOC
+	logger("Adding TOC (%d bytes)", len(jsonTOC))
+	if _, err := out.Write(jsonTOC); err != nil {
+		return fmt.Errorf("write TOC: %w", err)
+	}
+	// Boundary
+	if err := internal.WriteBoundary(out); err != nil {
+		return err
+	}
+	// Attachments
+	for _, att := range toc {
+		logger("Adding %q (%d bytes)", att.Name, att.Size)
+		if _, err := io.Copy(out, attachments[att.Name]); err != nil {
+			return fmt.Errorf("write attachment %q: %w", att.Name, err)
+		}
+	}
+	// Boundary
+	if err := internal.WriteBoundary(out); err != nil {
+		return err
+	}
+	return nil
+}
+
+// AppendFiles appends files which were already embedded to the newly to embed files and writes them to the binary.
+func AppendFiles(out io.Writer, attachments map[string]io.ReadSeeker, exePath string, offset int64, logger PrintlnFunc) error {
+	if logger == nil {
+		logger = func(string, ...interface{}) {}
+	}
+
+	toc, err := buildTOC(attachments)
+	if err != nil {
+		return fmt.Errorf("build TOC: %w", err)
+	}
+	jsonTOC, err := json.Marshal(toc)
+	if err != nil {
+		return fmt.Errorf("marshal TOC: %w", err)
+	}
+
+	// Executable
+	logger("Writing executable")
+	exe, err := os.Open(exePath)
+	if err != nil {
+		return err
+	}
+
+	logger("Offset in AppendFiles: %v", offset)
+	logger("Reader reads from %v until %v", io.SeekStart, offset)
+	section := io.NewSectionReader(exe, io.SeekStart, offset)
+	if _, err := io.Copy(out, section); err != nil {
+		return fmt.Errorf("error writing executable: %w", err)
+	}
+
 	// Boundary
 	if err := internal.WriteBoundary(out); err != nil {
 		return err
@@ -86,8 +146,36 @@ func Embed(out io.Writer, exe io.ReadSeeker, attachments map[string]io.ReadSeeke
 // attachments is a map of attachment names to the respective file's filepath.
 //
 // See Embed for more information.
-func EmbedFiles(out io.Writer, exe io.ReadSeeker, attachments map[string]string, logger PrintlnFunc) error {
-	reader := make(map[string]io.ReadSeeker, len(attachments))
+func EmbedFiles(out io.Writer, exe io.ReadSeeker, attachments map[string]string, exePath string, logger PrintlnFunc) error {
+	reader := make(map[string]io.ReadSeeker)
+	var alreadyEmbedded bool
+	var offset int64
+
+	offset, err := verifyTargetExe(exe)
+	if err != nil {
+		if err != ErrAlreadyEmbedded {
+			return fmt.Errorf("verify executable: %w", err)
+		}
+		alreadyEmbedded = true
+		log.Printf("executable already contains embedded resources, trying to append")
+		log.Printf("Marker at: %v", offset)
+		offset = internal.SeekBeforeBoundary(exe)
+		log.Printf("Before boundary at: %v", offset)
+
+		oldAttachments, err := SaveEmbeddedResources(exePath)
+		if err != nil {
+			return fmt.Errorf("error saving already embedded resources: %v", err)
+		}
+
+		for name, path := range oldAttachments {
+			file, err := os.Open(path)
+			if err != nil {
+				return fmt.Errorf("open attachment %q (%q): %w", name, path, err)
+			}
+			defer file.Close()
+			reader[name] = file
+		}
+	}
 
 	for name, path := range attachments {
 		file, err := os.Open(path)
@@ -98,20 +186,25 @@ func EmbedFiles(out io.Writer, exe io.ReadSeeker, attachments map[string]string,
 		defer file.Close()
 		reader[name] = file
 	}
-	return Embed(out, exe, reader, logger)
+
+	if alreadyEmbedded {
+		return AppendFiles(out, reader, exePath, offset, logger)
+	}
+	return Embed(out, exe, reader, exePath, offset, logger)
 }
 
 // verifyTargetExe ensures that the target executable is compatible.
 // The reader is seeked to the beginning afterwards.
-func verifyTargetExe(exe io.ReadSeeker) error {
+func verifyTargetExe(exe io.ReadSeeker) (int64, error) {
 	// Check if the target executable is compatible.
 	// Compatible executables are importing 'ember' in the correct version,
 	// causing a marker-string to be present in the binary.
 	// String-replace is used to ensure the marker is not present in the embedder-executable.
 	marker := "~~MagicMarker for XXX~~"
 	marker = strings.ReplaceAll(marker, "XXX", compatibleVersion)
-
-	return VerifyCompatibility(exe, marker)
+	offset, err := VerifyCompatibility(exe, marker)
+	log.Printf("Offset in verifyTargetExe: %v", offset)
+	return offset, err
 }
 
 // buildTOC returns the TOC (table-of-contents) for embedding the given data.
@@ -120,6 +213,7 @@ func buildTOC(attachments map[string]io.ReadSeeker) (internal.TOC, error) {
 	toc := make(internal.TOC, 0, len(attachments))
 
 	for name, r := range attachments {
+		log.Printf("building Toc entry for: %s", name)
 		size, err := getSize(r)
 		if err != nil {
 			return nil, fmt.Errorf("attachment %q: %w", name, err)
@@ -156,24 +250,59 @@ var ErrAlreadyEmbedded = errors.New("already contains embedded content")
 //    Otherwise it will end up in the embeder's executable as well, letting it appear compatible.)
 // Returns ErrAlreadyEmbedded if the target executable already contains attachments.
 // The reader is seeked to the beginning afterwards.
-func VerifyCompatibility(exe io.ReadSeeker, marker string) error {
+func VerifyCompatibility(exe io.ReadSeeker, marker string) (int64, error) {
 	// Rewind seeker to start-of-executable (just in case)
 	if _, err := exe.Seek(0, io.SeekStart); err != nil {
-		return err
+		return -1, err
 	}
 
-	offset := internal.SeekPattern(exe, []byte(marker))
-	if offset == -1 { // not a go executable, or does not import correct library(-version) and therefore not the correct marker
-		return errors.New("incompatible (magic string not found)")
+	offsetPattern := internal.SeekPattern(exe, []byte(marker))
+	log.Printf("Pattern offset: %v", offsetPattern)
+	if offsetPattern == -1 { // not a go executable, or does not import correct library(-version) and therefore not the correct marker
+		return -1, errors.New("incompatible (magic string not found)")
 	}
 
-	offset = internal.SeekBoundary(exe)
-	if offset != -1 {
-		return ErrAlreadyEmbedded
+	offsetBoundary := internal.SeekBoundary(exe)
+	log.Printf("Boundary offset: %v", offsetBoundary)
+	if offsetBoundary != -1 {
+		if _, err := exe.Seek(0, io.SeekStart); err != nil {
+			return -1, err
+		}
+		return offsetPattern, ErrAlreadyEmbedded
 	}
 
 	if _, err := exe.Seek(0, io.SeekStart); err != nil {
-		return err
+		return -1, err
 	}
-	return nil
+	return offsetPattern, nil
+}
+
+// SaveEmbeddedResources saves the already embedded resources temporarily
+func SaveEmbeddedResources(exePath string) (map[string]string, error) {
+	res := make(map[string]string)
+	attachments, err := ember.OpenExe(exePath)
+	if err != nil {
+		return res, err
+	}
+	defer attachments.Close()
+
+	contents := attachments.List()
+	tmpDir, err := ioutil.TempDir("", "")
+
+	for _, name := range contents {
+		r := attachments.Reader(name)
+		buf, err := ioutil.ReadAll(r)
+		if err != nil {
+			return res, err
+		}
+
+		filePath := filepath.Join(tmpDir, name)
+		err = ioutil.WriteFile(filePath, buf, 0644)
+		if err != nil {
+			return res, err
+		}
+
+		res[name] = filePath
+	}
+	return res, nil
 }
