@@ -20,10 +20,6 @@ const compatibleVersion = "maja42/ember/v1"
 // PrintlnFunc is used for logging the embedding progress.
 type PrintlnFunc func(format string, args ...interface{})
 
-type alreadyEmbedded struct {
-	resources map[string]string
-}
-
 // Embed embeds the attachments into the target executable.
 //
 // out receives the target executable including all attachments.
@@ -107,7 +103,6 @@ func AppendFiles(out io.Writer, attachments map[string]io.ReadSeeker, exePath st
 		return err
 	}
 
-	logger("Offset in AppendFiles: %v", offset)
 	logger("Reader reads from %v until %v", io.SeekStart, offset)
 	section := io.NewSectionReader(exe, io.SeekStart, offset)
 	if _, err := io.Copy(out, section); err != nil {
@@ -158,9 +153,8 @@ func EmbedFiles(out io.Writer, exe io.ReadSeeker, attachments map[string]string,
 		}
 		alreadyEmbedded = true
 		log.Printf("executable already contains embedded resources, trying to append")
-		log.Printf("Marker at: %v", offset)
+
 		offset = internal.SeekBeforeBoundary(exe)
-		log.Printf("Before boundary at: %v", offset)
 
 		oldAttachments, err := SaveEmbeddedResources(exePath)
 		if err != nil {
@@ -203,7 +197,6 @@ func verifyTargetExe(exe io.ReadSeeker) (int64, error) {
 	marker := "~~MagicMarker for XXX~~"
 	marker = strings.ReplaceAll(marker, "XXX", compatibleVersion)
 	offset, err := VerifyCompatibility(exe, marker)
-	log.Printf("Offset in verifyTargetExe: %v", offset)
 	return offset, err
 }
 
@@ -257,13 +250,11 @@ func VerifyCompatibility(exe io.ReadSeeker, marker string) (int64, error) {
 	}
 
 	offsetPattern := internal.SeekPattern(exe, []byte(marker))
-	log.Printf("Pattern offset: %v", offsetPattern)
 	if offsetPattern == -1 { // not a go executable, or does not import correct library(-version) and therefore not the correct marker
 		return -1, errors.New("incompatible (magic string not found)")
 	}
 
 	offsetBoundary := internal.SeekBoundary(exe)
-	log.Printf("Boundary offset: %v", offsetBoundary)
 	if offsetBoundary != -1 {
 		if _, err := exe.Seek(0, io.SeekStart); err != nil {
 			return -1, err
