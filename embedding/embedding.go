@@ -35,7 +35,7 @@ type PrintlnFunc func(format string, args ...interface{})
 //
 // Note that all ReadSeekers are seeked to their start before usage,
 // meaning the entirety of readable content is embedded. Use io.SectionReader to avoid this.
-func Embed(out io.Writer, exe io.ReadSeeker, attachments map[string]io.ReadSeeker, exePath string, offset int64, logger PrintlnFunc) error {
+func Embed(out io.Writer, attachments map[string]io.ReadSeeker, exePath string, offset int64, logger PrintlnFunc) error {
 	if logger == nil {
 		logger = func(string, ...interface{}) {}
 	}
@@ -49,64 +49,25 @@ func Embed(out io.Writer, exe io.ReadSeeker, attachments map[string]io.ReadSeeke
 		return fmt.Errorf("marshal TOC: %w", err)
 	}
 
-	// Executable
-	logger("Writing executable")
-	if _, err := io.Copy(out, exe); err != nil {
-		return fmt.Errorf("error writing executable: %w", err)
-	}
-	// Boundary
-	if err := internal.WriteBoundary(out); err != nil {
-		return err
-	}
-	// TOC
-	logger("Adding TOC (%d bytes)", len(jsonTOC))
-	if _, err := out.Write(jsonTOC); err != nil {
-		return fmt.Errorf("write TOC: %w", err)
-	}
-	// Boundary
-	if err := internal.WriteBoundary(out); err != nil {
-		return err
-	}
-	// Attachments
-	for _, att := range toc {
-		logger("Adding %q (%d bytes)", att.Name, att.Size)
-		if _, err := io.Copy(out, attachments[att.Name]); err != nil {
-			return fmt.Errorf("write attachment %q: %w", att.Name, err)
-		}
-	}
-	// Boundary
-	if err := internal.WriteBoundary(out); err != nil {
-		return err
-	}
-	return nil
-}
-
-// AppendFiles appends files which were already embedded to the newly to embed files and writes them to the binary.
-func AppendFiles(out io.Writer, attachments map[string]io.ReadSeeker, exePath string, offset int64, logger PrintlnFunc) error {
-	if logger == nil {
-		logger = func(string, ...interface{}) {}
-	}
-
-	toc, err := buildTOC(attachments)
-	if err != nil {
-		return fmt.Errorf("build TOC: %w", err)
-	}
-	jsonTOC, err := json.Marshal(toc)
-	if err != nil {
-		return fmt.Errorf("marshal TOC: %w", err)
-	}
-
-	// Executable
 	logger("Writing executable")
 	exe, err := os.Open(exePath)
 	if err != nil {
 		return err
 	}
 
-	logger("Reader reads from %v until %v", io.SeekStart, offset)
-	section := io.NewSectionReader(exe, io.SeekStart, offset)
-	if _, err := io.Copy(out, section); err != nil {
-		return fmt.Errorf("error writing executable: %w", err)
+	// write the executable depending on the boundary offset
+	// if offset > 0 there are already embedded resources, which means we write
+	// the executable until the boundary and append the new+old attachments
+	log.Println(offset)
+	if offset <= 0 {
+		if _, err := io.Copy(out, exe); err != nil {
+			return fmt.Errorf("error writing executable: %w", err)
+		}
+	} else {
+		section := io.NewSectionReader(exe, io.SeekStart, offset)
+		if _, err := io.Copy(out, section); err != nil {
+			return fmt.Errorf("error writing executable: %w", err)
+		}
 	}
 
 	// Boundary
@@ -143,15 +104,12 @@ func AppendFiles(out io.Writer, attachments map[string]io.ReadSeeker, exePath st
 // See Embed for more information.
 func EmbedFiles(out io.Writer, exe io.ReadSeeker, attachments map[string]string, exePath string, logger PrintlnFunc) error {
 	reader := make(map[string]io.ReadSeeker)
-	var alreadyEmbedded bool
 	var offset int64
 
-	offset, err := verifyTargetExe(exe)
-	if err != nil {
+	if err := verifyTargetExe(exe); err != nil {
 		if err != ErrAlreadyEmbedded {
 			return fmt.Errorf("verify executable: %w", err)
 		}
-		alreadyEmbedded = true
 		log.Printf("executable already contains embedded resources, trying to append")
 
 		offset = internal.SeekBeforeBoundary(exe)
@@ -181,23 +139,20 @@ func EmbedFiles(out io.Writer, exe io.ReadSeeker, attachments map[string]string,
 		reader[name] = file
 	}
 
-	if alreadyEmbedded {
-		return AppendFiles(out, reader, exePath, offset, logger)
-	}
-	return Embed(out, exe, reader, exePath, offset, logger)
+	return Embed(out, reader, exePath, offset, logger)
 }
 
 // verifyTargetExe ensures that the target executable is compatible.
 // The reader is seeked to the beginning afterwards.
-func verifyTargetExe(exe io.ReadSeeker) (int64, error) {
+// Returns the offset of the
+func verifyTargetExe(exe io.ReadSeeker) error {
 	// Check if the target executable is compatible.
 	// Compatible executables are importing 'ember' in the correct version,
 	// causing a marker-string to be present in the binary.
 	// String-replace is used to ensure the marker is not present in the embedder-executable.
 	marker := "~~MagicMarker for XXX~~"
 	marker = strings.ReplaceAll(marker, "XXX", compatibleVersion)
-	offset, err := VerifyCompatibility(exe, marker)
-	return offset, err
+	return VerifyCompatibility(exe, marker)
 }
 
 // buildTOC returns the TOC (table-of-contents) for embedding the given data.
@@ -243,29 +198,29 @@ var ErrAlreadyEmbedded = errors.New("already contains embedded content")
 //    Otherwise it will end up in the embeder's executable as well, letting it appear compatible.)
 // Returns ErrAlreadyEmbedded if the target executable already contains attachments.
 // The reader is seeked to the beginning afterwards.
-func VerifyCompatibility(exe io.ReadSeeker, marker string) (int64, error) {
+func VerifyCompatibility(exe io.ReadSeeker, marker string) error {
 	// Rewind seeker to start-of-executable (just in case)
 	if _, err := exe.Seek(0, io.SeekStart); err != nil {
-		return -1, err
+		return err
 	}
 
-	offsetPattern := internal.SeekPattern(exe, []byte(marker))
-	if offsetPattern == -1 { // not a go executable, or does not import correct library(-version) and therefore not the correct marker
-		return -1, errors.New("incompatible (magic string not found)")
+	offset := internal.SeekPattern(exe, []byte(marker))
+	if offset == -1 { // not a go executable, or does not import correct library(-version) and therefore not the correct marker
+		return errors.New("incompatible (magic string not found)")
 	}
 
-	offsetBoundary := internal.SeekBoundary(exe)
-	if offsetBoundary != -1 {
+	offset = internal.SeekBoundary(exe)
+	if offset != -1 {
 		if _, err := exe.Seek(0, io.SeekStart); err != nil {
-			return -1, err
+			return err
 		}
-		return offsetPattern, ErrAlreadyEmbedded
+		return ErrAlreadyEmbedded
 	}
 
 	if _, err := exe.Seek(0, io.SeekStart); err != nil {
-		return -1, err
+		return err
 	}
-	return offsetPattern, nil
+	return nil
 }
 
 // SaveEmbeddedResources saves the already embedded resources temporarily
